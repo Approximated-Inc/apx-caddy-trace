@@ -1,6 +1,7 @@
 package apxtrace
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -16,6 +17,8 @@ type MarkHandler struct {
 	Phase    string            `json:"phase,omitempty"`
 	Label    string            `json:"label,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	app AppRef
 }
 
 // CaddyModule registers the mark handler.
@@ -26,7 +29,24 @@ func (*MarkHandler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (h *MarkHandler) Provision(ctx caddy.Context) error             { return nil }
+// Provision fetches the TraceApp reference. Not strictly required — events
+// emitted via tc.App, which was captured in ServeHTTP of the outer handler —
+// but we look it up for parity and early-failure if the app isn't configured.
+func (h *MarkHandler) Provision(ctx caddy.Context) error {
+	if h.app == nil {
+		app, err := ctx.App("apx_trace")
+		if err != nil {
+			return fmt.Errorf("apx_trace_mark requires apx_trace app to be configured: %w", err)
+		}
+		ta, ok := app.(*TraceApp)
+		if !ok {
+			return fmt.Errorf("apx_trace_mark: unexpected app type %T", app)
+		}
+		h.app = ta
+	}
+	return nil
+}
+
 func (h *MarkHandler) UnmarshalCaddyfile(*caddyfile.Dispenser) error { return nil }
 
 func (h *MarkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -43,7 +63,7 @@ func (h *MarkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		if h.Label == "edge_sequence" {
 			evtType = EventEdgeSequenceEntered
 		}
-		tc.Emitter.Emit(Event{
+		tc.App.EmitEvent(Event{
 			Type:   evtType,
 			TsNs:   now,
 			Source: SourceCluster,
@@ -52,13 +72,13 @@ func (h *MarkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 				"metadata":   h.Metadata,
 				"request_id": tc.RequestID,
 			},
-		})
+		}, tc.Token)
 		tc.LastSnapshot = Snapshot(r)
 
 	case "post":
 		curr := Snapshot(r)
 		diff := DiffSnapshots(tc.LastSnapshot, curr)
-		tc.Emitter.Emit(Event{
+		tc.App.EmitEvent(Event{
 			Type:   EventRequestMutation,
 			TsNs:   now,
 			Source: SourceCluster,
@@ -68,7 +88,7 @@ func (h *MarkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 				"diff":       diff,
 				"request_id": tc.RequestID,
 			},
-		})
+		}, tc.Token)
 		tc.LastSnapshot = curr
 	}
 

@@ -7,7 +7,7 @@ import (
 
 // metricRequestsTotal counts outer-wrapper invocations by outcome.
 // Labels:
-//   result = "no_header" | "invalid_token" | "redis_error" | "active"
+//   result = "no_header" | "invalid_token" | "active"
 var metricRequestsTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "apx_trace_requests_total",
@@ -16,16 +16,16 @@ var metricRequestsTotal = promauto.NewCounterVec(
 	[]string{"result"},
 )
 
-// metricEventsEmittedTotal counts events emitted to Redis streams.
+// metricEventsEmittedTotal counts events successfully delivered to the sink.
 var metricEventsEmittedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "apx_trace_events_emitted_total",
-		Help: "apx-caddy-trace events emitted to Redis streams",
+		Help: "apx-caddy-trace events emitted to the event sink",
 	},
 	[]string{"type"},
 )
 
-// metricEventsDropped counts events dropped due to full per-session buffer.
+// metricEventsDropped counts events dropped due to full outbound buffer.
 var metricEventsDropped = promauto.NewCounter(
 	prometheus.CounterOpts{
 		Name: "apx_trace_events_dropped_total",
@@ -33,19 +33,19 @@ var metricEventsDropped = promauto.NewCounter(
 	},
 )
 
-// metricRedisErrors counts Redis errors observed by the plugin.
-var metricRedisErrors = promauto.NewCounter(
+// metricEventSinkErrors counts HTTP event-sink delivery errors.
+var metricEventSinkErrors = promauto.NewCounter(
 	prometheus.CounterOpts{
-		Name: "apx_trace_redis_errors_total",
-		Help: "apx-caddy-trace Redis operation errors",
+		Name: "apx_trace_event_sink_errors_total",
+		Help: "apx-caddy-trace event-sink HTTP delivery errors",
 	},
 )
 
-// metricRedisWriteDuration observes XADD latency in seconds.
-var metricRedisWriteDuration = promauto.NewHistogram(
+// metricEventSinkDuration observes event-sink POST latency in seconds.
+var metricEventSinkDuration = promauto.NewHistogram(
 	prometheus.HistogramOpts{
-		Name:    "apx_trace_redis_write_duration_seconds",
-		Help:    "apx-caddy-trace Redis XADD latency",
+		Name:    "apx_trace_event_sink_duration_seconds",
+		Help:    "apx-caddy-trace event-sink POST latency",
 		Buckets: prometheus.ExponentialBuckets(0.0005, 2, 10),
 	},
 )

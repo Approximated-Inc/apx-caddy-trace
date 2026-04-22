@@ -20,7 +20,7 @@ const (
 	EventEventsDropped       = "events_dropped"
 )
 
-// Event is the wire format serialized into Redis streams.
+// Event is the wire format POSTed to the app's event sink endpoint.
 type Event struct {
 	Type    string         `json:"type"`
 	TsNs    int64          `json:"ts_ns"`

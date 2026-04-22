@@ -2,56 +2,29 @@ package apxtrace
 
 import (
 	"bufio"
-	"context"
-	"crypto/tls"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"regexp"
-	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
-// RedisConfig is an inline Redis configuration passed via the handler's JSON.
-// When present, it takes precedence over env-based configuration.
-type RedisConfig struct {
-	Host     string `json:"host,omitempty"`
-	Port     int    `json:"port,omitempty"`
-	DB       int    `json:"db,omitempty"`
-	Password string `json:"password,omitempty"`
-	TLS      bool   `json:"tls,omitempty"`
-}
-
-// armer is the subset of redis needed to check arming keys.
-type armer interface {
-	Get(ctx context.Context, key string) *redis.StringCmd
-	streamer
-}
-
 // TraceHandler is the outer wrapper installed once per server.
-// Dormant unless X-APX-Debug-Trace header is present with a valid token.
+// Dormant unless the configured trace header is present with a valid,
+// HMAC-signed token.
 type TraceHandler struct {
-	Redis      *RedisConfig `json:"redis,omitempty"`
-	HeaderName string       `json:"header_name,omitempty"`
+	HeaderName string `json:"header_name,omitempty"`
 
-	logger       *zap.Logger
-	headerName   string
-	arm          armer
-	emitterMaker func(token string) *Emitter
-	redactor     *Redactor
-
-	mu       sync.Mutex
-	emitters map[string]*Emitter
+	logger     *zap.Logger
+	headerName string
+	app        AppRef
+	redactor   *Redactor
 }
 
 // CaddyModule returns the Caddy module information.
@@ -62,24 +35,23 @@ func (*TraceHandler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision initializes the handler with a Redis client + redactor.
+// Provision looks up the TraceApp (registered at root ID "apx_trace") and
+// stashes a reference. Fails if the app is not configured.
 func (h *TraceHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
 	h.headerName = h.resolveHeaderName()
 	h.redactor = DefaultRedactor()
-	h.emitters = make(map[string]*Emitter)
 
-	if h.arm == nil {
-		opts, err := h.resolveRedisOpts()
+	if h.app == nil {
+		app, err := ctx.App("apx_trace")
 		if err != nil {
-			return fmt.Errorf("apx_trace provision: %w", err)
+			return fmt.Errorf("apx_trace handler requires apx_trace app to be configured: %w", err)
 		}
-		h.arm = redis.NewClient(opts)
-	}
-	if h.emitterMaker == nil {
-		h.emitterMaker = func(token string) *Emitter {
-			return NewEmitter(h.arm, streamKeyFor(token), 256)
+		ta, ok := app.(*TraceApp)
+		if !ok {
+			return fmt.Errorf("apx_trace handler: unexpected app type %T", app)
 		}
+		h.app = ta
 	}
 	return nil
 }
@@ -91,29 +63,8 @@ func (h *TraceHandler) resolveHeaderName() string {
 	return defaultStringEnv("APX_TRACE_HEADER", "X-APX-Debug-Trace")
 }
 
-func (h *TraceHandler) resolveRedisOpts() (*redis.Options, error) {
-	if h.Redis != nil && h.Redis.Host != "" {
-		opts := &redis.Options{
-			Addr:         fmt.Sprintf("%s:%d", h.Redis.Host, h.Redis.Port),
-			Password:     h.Redis.Password,
-			DB:           h.Redis.DB,
-			DialTimeout:  2 * time.Second,
-			ReadTimeout:  1 * time.Second,
-			WriteTimeout: 1 * time.Second,
-			PoolSize:     10,
-		}
-		if h.Redis.TLS {
-			opts.TLSConfig = &tls.Config{}
-		}
-		return opts, nil
-	}
-	return RedisOptsFromEnv()
-}
-
 // UnmarshalCaddyfile parses an empty block.
 func (h *TraceHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
-
-var tokenFormat = regexp.MustCompile(`^[A-Za-z0-9_-]{32,64}$`)
 
 // ServeHTTP is the hot path. Must be cheap when no trace header is present.
 func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -122,49 +73,26 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		metricRequestsTotal.WithLabelValues("no_header").Inc()
 		return next.ServeHTTP(w, r)
 	}
-	if !tokenFormat.MatchString(token) {
-		metricRequestsTotal.WithLabelValues("invalid_token").Inc()
-		return next.ServeHTTP(w, r)
-	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
-	defer cancel()
-
-	raw, err := h.arm.Get(ctx, armKeyFor(token)).Result()
+	payload, err := ValidateToken(token, h.app.Secret())
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			metricRequestsTotal.WithLabelValues("invalid_token").Inc()
-			return next.ServeHTTP(w, r)
-		}
-		metricRedisErrors.Inc()
-		metricRequestsTotal.WithLabelValues("redis_error").Inc()
-		return next.ServeHTTP(w, r)
-	}
-
-	var armPayload struct {
-		VhostID       string `json:"virtual_host_id"`
-		ProxyServerID string `json:"proxy_server_id"`
-	}
-	if err := json.Unmarshal([]byte(raw), &armPayload); err != nil {
 		metricRequestsTotal.WithLabelValues("invalid_token").Inc()
 		return next.ServeHTTP(w, r)
 	}
 
 	metricRequestsTotal.WithLabelValues("active").Inc()
 
-	emitter := h.acquireEmitter(token)
 	tc := &TraceContext{
-		Token:         token,
-		VhostID:       armPayload.VhostID,
-		ProxyServerID: armPayload.ProxyServerID,
-		RequestID:     uuid.NewString(),
-		StartTime:     time.Now(),
-		Emitter:       emitter,
-		LastSnapshot:  Snapshot(r),
+		Token:          token,
+		DebugRequestID: payload.DebugRequestID,
+		VhostID:        payload.VhostID,
+		RequestID:      uuid.NewString(),
+		StartTime:      time.Now(),
+		App:            h.app,
+		LastSnapshot:   Snapshot(r),
 	}
 
-	// cluster_received
-	emitter.Emit(Event{
+	h.app.EmitEvent(Event{
 		Type:   EventClusterReceived,
 		TsNs:   time.Now().UnixNano(),
 		Source: SourceCluster,
@@ -176,7 +104,7 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 			"remote_ip":  r.RemoteAddr,
 			"request_id": tc.RequestID,
 		},
-	})
+	}, token)
 
 	wrapped := &responseRecorder{ResponseWriter: w, status: 200}
 	req := r.WithContext(withTrace(r.Context(), tc))
@@ -184,31 +112,30 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	var servErr error
 	defer func() {
 		total := time.Since(tc.StartTime)
-		payload := map[string]any{
+		p := map[string]any{
 			"total_duration_ns": total.Nanoseconds(),
 			"request_id":        tc.RequestID,
 		}
 		if wrapped.hijacked {
-			payload["hijacked"] = true
+			p["hijacked"] = true
 		} else {
-			payload["status"] = wrapped.status
-			payload["response_headers"] = h.redactor.RedactHeaders(wrapped.Header())
-			payload["bytes_written"] = wrapped.bytes
+			p["status"] = wrapped.status
+			p["response_headers"] = h.redactor.RedactHeaders(wrapped.Header())
+			p["bytes_written"] = wrapped.bytes
 		}
 		if servErr != nil {
-			payload["error"] = servErr.Error()
+			p["error"] = servErr.Error()
 		}
 		rec := recover()
 		if rec != nil {
-			payload["panic"] = fmt.Sprintf("%v", rec)
+			p["panic"] = fmt.Sprintf("%v", rec)
 		}
-		emitter.Emit(Event{
+		h.app.EmitEvent(Event{
 			Type:    EventClusterResponse,
 			TsNs:    time.Now().UnixNano(),
 			Source:  SourceCluster,
-			Payload: payload,
-		})
-		go h.releaseEmitter(token, 2*time.Second)
+			Payload: p,
+		}, token)
 
 		// Re-panic so Caddy's server-level recovery can handle it as usual.
 		if rec != nil {
@@ -218,33 +145,6 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	servErr = next.ServeHTTP(wrapped, req)
 	return servErr
-}
-
-func (h *TraceHandler) acquireEmitter(token string) *Emitter {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.emitters == nil {
-		h.emitters = make(map[string]*Emitter)
-	}
-	if e, ok := h.emitters[token]; ok {
-		return e
-	}
-	e := h.emitterMaker(token)
-	h.emitters[token] = e
-	return e
-}
-
-func (h *TraceHandler) releaseEmitter(token string, after time.Duration) {
-	time.Sleep(after)
-	h.mu.Lock()
-	e, ok := h.emitters[token]
-	if ok {
-		delete(h.emitters, token)
-	}
-	h.mu.Unlock()
-	if e != nil {
-		e.Close()
-	}
 }
 
 // responseRecorder captures status + bytes + headers while still writing to w.
@@ -307,9 +207,6 @@ func (rr *responseRecorder) Push(target string, opts *http.PushOptions) error {
 	}
 	return http.ErrNotSupported
 }
-
-func armKeyFor(token string) string    { return "debug:trace:" + token }
-func streamKeyFor(token string) string { return "debug:trace:" + token + ":events" }
 
 func defaultStringEnv(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {

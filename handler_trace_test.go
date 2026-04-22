@@ -2,38 +2,61 @@ package apxtrace
 
 import (
 	"bufio"
-	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
-type fakeRedis struct {
-	*fakeStreamer
-	arms map[string]string
+// fakeTraceApp is an in-memory AppRef used throughout the test suite.
+type fakeTraceApp struct {
+	mu     sync.Mutex
+	events []Event
+	tokens []string
+	secret string
 }
 
-func (f *fakeRedis) Get(ctx context.Context, key string) *redis.StringCmd {
-	cmd := redis.NewStringCmd(ctx)
-	if v, ok := f.arms[key]; ok {
-		cmd.SetVal(v)
-	} else {
-		cmd.SetErr(redis.Nil)
-	}
-	return cmd
+func newFakeTraceApp(secret string) *fakeTraceApp {
+	return &fakeTraceApp{secret: secret}
 }
 
-func newFakeRedis() *fakeRedis {
-	return &fakeRedis{
-		fakeStreamer: &fakeStreamer{},
-		arms:         map[string]string{},
+func (f *fakeTraceApp) EmitEvent(evt Event, token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, evt)
+	f.tokens = append(f.tokens, token)
+}
+
+func (f *fakeTraceApp) Secret() string { return f.secret }
+
+func (f *fakeTraceApp) eventCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.events)
+}
+
+func (f *fakeTraceApp) eventsCopy() []Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]Event, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+// validTokenFor mints a valid trace token for the given secret + claims.
+func validTokenFor(t *testing.T, secret string, payload TokenPayload) string {
+	t.Helper()
+	if payload.Exp == 0 {
+		payload.Exp = time.Now().Add(time.Hour).Unix()
 	}
+	tok, err := SignToken(payload, secret)
+	require.NoError(t, err)
+	return tok
 }
 
 func nextHandlerOK() caddyhttp.HandlerFunc {
@@ -45,37 +68,63 @@ func nextHandlerOK() caddyhttp.HandlerFunc {
 }
 
 func TestTraceHandler_NoHeader_IsNoop(t *testing.T) {
-	fr := newFakeRedis()
+	app := newFakeTraceApp("secret")
 	h := &TraceHandler{
 		headerName: "X-APX-Debug-Trace",
-		arm:        fr,
+		app:        app,
 		redactor:   DefaultRedactor(),
-		emitterMaker: func(token string) *Emitter {
-			return NewEmitter(fr, streamKeyFor(token), 64)
-		},
 	}
 	r := httptest.NewRequest("GET", "/foo", nil)
 	w := httptest.NewRecorder()
 	err := h.ServeHTTP(w, r, nextHandlerOK())
 	require.NoError(t, err)
-	require.Equal(t, 0, fr.addCount(), "no events should be written without header")
+	require.Equal(t, 0, app.eventCount(), "no events should be emitted without header")
 }
 
 func TestTraceHandler_InvalidToken_IsNoop(t *testing.T) {
-	fr := newFakeRedis()
+	app := newFakeTraceApp("secret")
 	h := &TraceHandler{
 		headerName: "X-APX-Debug-Trace",
-		arm:        fr,
+		app:        app,
 		redactor:   DefaultRedactor(),
-		emitterMaker: func(token string) *Emitter {
-			return NewEmitter(fr, streamKeyFor(token), 64)
-		},
 	}
 	r := httptest.NewRequest("GET", "/foo", nil)
-	r.Header.Set("X-APX-Debug-Trace", "not-armed-token-0000000000000000")
+	r.Header.Set("X-APX-Debug-Trace", "bogus-not-a-real-token")
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandlerOK()))
-	require.Equal(t, 0, fr.addCount())
+	require.Equal(t, 0, app.eventCount())
+}
+
+func TestTraceHandler_WrongSecret_IsNoop(t *testing.T) {
+	app := newFakeTraceApp("real-secret")
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	// Mint with a different secret — signature mismatch.
+	tok := validTokenFor(t, "wrong-secret", TokenPayload{DebugRequestID: "dr-1", VhostID: 1})
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandlerOK()))
+	require.Equal(t, 0, app.eventCount())
+}
+
+func TestTraceHandler_ExpiredToken_IsNoop(t *testing.T) {
+	secret := "s"
+	app := newFakeTraceApp(secret)
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-1", VhostID: 1, Exp: 1})
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextHandlerOK()))
+	require.Equal(t, 0, app.eventCount())
 }
 
 type flusherWriter struct {
@@ -123,64 +172,38 @@ func TestResponseRecorder_UnwrapReturnsInner(t *testing.T) {
 	require.Equal(t, http.ResponseWriter(inner), rr.Unwrap())
 }
 
-func TestTraceHandler_ResolveRedisOpts_InlineConfigWins(t *testing.T) {
-	h := &TraceHandler{
-		Redis: &RedisConfig{Host: "inline.example", Port: 6390, DB: 2, Password: "secret"},
-	}
-	opts, err := h.resolveRedisOpts()
-	require.NoError(t, err)
-	require.Equal(t, "inline.example:6390", opts.Addr)
-	require.Equal(t, 2, opts.DB)
-	require.Equal(t, "secret", opts.Password)
-	require.Nil(t, opts.TLSConfig)
-}
-
-func TestTraceHandler_ResolveRedisOpts_TLSEnablesTLSConfig(t *testing.T) {
-	h := &TraceHandler{Redis: &RedisConfig{Host: "h", Port: 6379, TLS: true}}
-	opts, err := h.resolveRedisOpts()
-	require.NoError(t, err)
-	require.NotNil(t, opts.TLSConfig)
-}
-
-func TestTraceHandler_ResolveRedisOpts_FallsBackToEnv(t *testing.T) {
-	t.Setenv("APX_TRACE_REDIS_URL", "redis://envfallback.example:6380/3")
-	h := &TraceHandler{Redis: nil}
-	opts, err := h.resolveRedisOpts()
-	require.NoError(t, err)
-	require.Equal(t, "envfallback.example:6380", opts.Addr)
-	require.Equal(t, 3, opts.DB)
-}
-
-func TestTraceHandler_ResolveRedisOpts_EmptyHostFallsBackToEnv(t *testing.T) {
-	t.Setenv("APX_TRACE_REDIS_URL", "redis://envfallback2.example:6381/0")
-	h := &TraceHandler{Redis: &RedisConfig{Port: 1234}} // Host blank
-	opts, err := h.resolveRedisOpts()
-	require.NoError(t, err)
-	require.Equal(t, "envfallback2.example:6381", opts.Addr)
-}
-
 func TestTraceHandler_ResolveHeaderName_InlineWins(t *testing.T) {
 	h := &TraceHandler{HeaderName: "X-Custom-Trace"}
 	require.Equal(t, "X-Custom-Trace", h.resolveHeaderName())
 }
 
+func TestTraceHandler_ResolveHeaderName_EnvFallback(t *testing.T) {
+	t.Setenv("APX_TRACE_HEADER", "X-From-Env")
+	h := &TraceHandler{}
+	require.Equal(t, "X-From-Env", h.resolveHeaderName())
+}
+
 func TestTraceHandler_ValidToken_EmitsReceivedAndResponse(t *testing.T) {
-	fr := newFakeRedis()
-	token := "abcdefabcdefabcdefabcdefabcdefab"
-	fr.arms["debug:trace:"+token] = `{"virtual_host_id":"vh1","proxy_server_id":"ps1"}`
+	secret := "test-secret"
+	app := newFakeTraceApp(secret)
 	h := &TraceHandler{
 		headerName: "X-APX-Debug-Trace",
-		arm:        fr,
+		app:        app,
 		redactor:   DefaultRedactor(),
-		emitterMaker: func(token string) *Emitter {
-			return NewEmitter(fr, streamKeyFor(token), 64)
-		},
 	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-xyz", VhostID: 99})
+
 	r := httptest.NewRequest("GET", "/foo", nil)
-	r.Header.Set("X-APX-Debug-Trace", token)
+	r.Header.Set("X-APX-Debug-Trace", tok)
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandlerOK()))
 
-	// Two events expected: cluster_received + cluster_response.
-	require.Eventually(t, func() bool { return fr.addCount() >= 2 }, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, 2, app.eventCount(), "expected cluster_received + cluster_response")
+	events := app.eventsCopy()
+	require.Equal(t, EventClusterReceived, events[0].Type)
+	require.Equal(t, EventClusterResponse, events[1].Type)
+	require.Equal(t, tok, app.tokens[0])
+	require.Equal(t, tok, app.tokens[1])
+	// request_id should be consistent between received + response.
+	require.Equal(t, events[0].Payload["request_id"], events[1].Payload["request_id"])
 }

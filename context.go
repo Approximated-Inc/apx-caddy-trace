@@ -8,18 +8,18 @@ import (
 type ctxKey struct{}
 
 // TraceContext travels on the request context for the duration of a traced
-// request. Only present when a valid trace token is confirmed in Redis.
+// request. Only present when a valid trace token was verified by HMAC.
 //
 // Not safe for concurrent mutation across goroutines: the trace pipeline
 // assumes a single-threaded handler chain per request.
 type TraceContext struct {
-	Token         string
-	VhostID       string
-	ProxyServerID string
-	RequestID     string
-	StartTime     time.Time
-	Emitter      *Emitter
-	LastSnapshot RequestSnapshot
+	Token          string
+	DebugRequestID string
+	VhostID        int64
+	RequestID      string
+	StartTime      time.Time
+	App            AppRef
+	LastSnapshot   RequestSnapshot
 }
 
 func withTrace(ctx context.Context, tc *TraceContext) context.Context {

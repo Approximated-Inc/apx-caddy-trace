@@ -18,6 +18,7 @@ type TraceTransport struct {
 
 	inner    http.RoundTripper
 	redactor *Redactor
+	app      AppRef
 }
 
 // CaddyModule registers the transport.
@@ -28,7 +29,7 @@ func (*TraceTransport) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision loads the inner transport module.
+// Provision loads the inner transport module and looks up the TraceApp.
 func (t *TraceTransport) Provision(ctx caddy.Context) error {
 	t.redactor = DefaultRedactor()
 	if len(t.InnerRaw) == 0 {
@@ -44,6 +45,18 @@ func (t *TraceTransport) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("apx_trace transport: inner is not RoundTripper: %T", val)
 	}
 	t.inner = rt
+
+	if t.app == nil {
+		app, err := ctx.App("apx_trace")
+		if err != nil {
+			return fmt.Errorf("apx_trace transport requires apx_trace app to be configured: %w", err)
+		}
+		ta, ok := app.(*TraceApp)
+		if !ok {
+			return fmt.Errorf("apx_trace transport: unexpected app type %T", app)
+		}
+		t.app = ta
+	}
 	return nil
 }
 
@@ -69,7 +82,7 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 
 	upstream := fmt.Sprintf("%s://%s", r.URL.Scheme, r.URL.Host)
-	tc.Emitter.Emit(Event{
+	tc.App.EmitEvent(Event{
 		Type:   EventUpstreamRequest,
 		TsNs:   time.Now().UnixNano(),
 		Source: SourceCluster,
@@ -80,14 +93,14 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			"headers":    redactor.RedactHeaders(r.Header),
 			"request_id": tc.RequestID,
 		},
-	})
+	}, tc.Token)
 
 	start := time.Now()
 	resp, err := t.inner.RoundTrip(r)
 	duration := time.Since(start)
 
 	if err != nil {
-		tc.Emitter.Emit(Event{
+		tc.App.EmitEvent(Event{
 			Type:   EventUpstreamError,
 			TsNs:   time.Now().UnixNano(),
 			Source: SourceCluster,
@@ -98,11 +111,11 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 				"duration_ms":    duration.Milliseconds(),
 				"request_id":     tc.RequestID,
 			},
-		})
+		}, tc.Token)
 		return resp, err
 	}
 
-	tc.Emitter.Emit(Event{
+	tc.App.EmitEvent(Event{
 		Type:   EventUpstreamResponse,
 		TsNs:   time.Now().UnixNano(),
 		Source: SourceCluster,
@@ -113,7 +126,7 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			"duration_ms": duration.Milliseconds(),
 			"request_id":  tc.RequestID,
 		},
-	})
+	}, tc.Token)
 	return resp, nil
 }
 
