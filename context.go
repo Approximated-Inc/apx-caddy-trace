@@ -9,6 +9,9 @@ type ctxKey struct{}
 
 // TraceContext travels on the request context for the duration of a traced
 // request. Only present when a valid trace token is confirmed in Redis.
+//
+// Not safe for concurrent mutation across goroutines: the trace pipeline
+// assumes a single-threaded handler chain per request.
 type TraceContext struct {
 	Token         string
 	VhostID       string

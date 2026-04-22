@@ -45,3 +45,27 @@ func TestDiffSnapshots_URIAndMethodChange(t *testing.T) {
 	require.Equal(t, "GET", diff.MethodChange.Before)
 	require.Equal(t, "POST", diff.MethodChange.After)
 }
+
+func TestDiffSnapshots_DetectsMultiValueHeaderChange(t *testing.T) {
+	before := RequestSnapshot{
+		Method:  "GET",
+		URI:     "/a",
+		Headers: http.Header{"Set-Cookie": {"a=1", "b=2"}},
+	}
+	after := RequestSnapshot{
+		Method:  "GET",
+		URI:     "/a",
+		Headers: http.Header{"Set-Cookie": {"a=1"}},
+	}
+	diff := DiffSnapshots(before, after)
+	require.Contains(t, diff.HeadersChanged, "Set-Cookie")
+}
+
+func TestDiffSnapshots_OrderingIsSorted(t *testing.T) {
+	before := RequestSnapshot{Headers: http.Header{}}
+	after := RequestSnapshot{
+		Headers: http.Header{"Z-Last": {"1"}, "A-First": {"1"}, "M-Mid": {"1"}},
+	}
+	diff := DiffSnapshots(before, after)
+	require.Equal(t, []string{"A-First", "M-Mid", "Z-Last"}, diff.HeadersAdded)
+}

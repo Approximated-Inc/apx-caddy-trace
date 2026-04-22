@@ -2,6 +2,8 @@ package apxtrace
 
 import (
 	"net/http"
+	"slices"
+	"sort"
 )
 
 // RequestSnapshot captures the parts of a request we diff over time
@@ -58,7 +60,7 @@ func DiffSnapshots(before, after RequestSnapshot) SnapshotDiff {
 	for k := range afterKeys {
 		if !beforeKeys[k] {
 			diff.HeadersAdded = append(diff.HeadersAdded, k)
-		} else if before.Headers.Get(k) != after.Headers.Get(k) {
+		} else if !slices.Equal(before.Headers[k], after.Headers[k]) {
 			diff.HeadersChanged = append(diff.HeadersChanged, k)
 		}
 	}
@@ -74,5 +76,9 @@ func DiffSnapshots(before, after RequestSnapshot) SnapshotDiff {
 	if before.Method != after.Method {
 		diff.MethodChange = &Change{Before: before.Method, After: after.Method}
 	}
+
+	sort.Strings(diff.HeadersAdded)
+	sort.Strings(diff.HeadersRemoved)
+	sort.Strings(diff.HeadersChanged)
 	return diff
 }
