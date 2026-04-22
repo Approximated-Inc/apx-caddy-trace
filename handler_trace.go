@@ -1,10 +1,12 @@
 package apxtrace
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -138,29 +140,43 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	wrapped := &responseRecorder{ResponseWriter: w, status: 200}
 	req := r.WithContext(withTrace(r.Context(), tc))
-	servErr := next.ServeHTTP(wrapped, req)
 
-	total := time.Since(tc.StartTime)
-	payload := map[string]any{
-		"status":            wrapped.status,
-		"response_headers":  h.redactor.RedactHeaders(wrapped.Header()),
-		"bytes_written":     wrapped.bytes,
-		"total_duration_ns": total.Nanoseconds(),
-		"request_id":        tc.RequestID,
-	}
-	if servErr != nil {
-		payload["error"] = servErr.Error()
-	}
-	emitter.Emit(Event{
-		Type:    EventClusterResponse,
-		TsNs:    time.Now().UnixNano(),
-		Source:  SourceCluster,
-		Payload: payload,
-	})
+	var servErr error
+	defer func() {
+		total := time.Since(tc.StartTime)
+		payload := map[string]any{
+			"total_duration_ns": total.Nanoseconds(),
+			"request_id":        tc.RequestID,
+		}
+		if wrapped.hijacked {
+			payload["hijacked"] = true
+		} else {
+			payload["status"] = wrapped.status
+			payload["response_headers"] = h.redactor.RedactHeaders(wrapped.Header())
+			payload["bytes_written"] = wrapped.bytes
+		}
+		if servErr != nil {
+			payload["error"] = servErr.Error()
+		}
+		rec := recover()
+		if rec != nil {
+			payload["panic"] = fmt.Sprintf("%v", rec)
+		}
+		emitter.Emit(Event{
+			Type:    EventClusterResponse,
+			TsNs:    time.Now().UnixNano(),
+			Source:  SourceCluster,
+			Payload: payload,
+		})
+		go h.releaseEmitter(token, 2*time.Second)
 
-	// Release emitter asynchronously after request completes.
-	go h.releaseEmitter(token, 2*time.Second)
+		// Re-panic so Caddy's server-level recovery can handle it as usual.
+		if rec != nil {
+			panic(rec)
+		}
+	}()
 
+	servErr = next.ServeHTTP(wrapped, req)
 	return servErr
 }
 
@@ -194,9 +210,10 @@ func (h *TraceHandler) releaseEmitter(token string, after time.Duration) {
 // responseRecorder captures status + bytes + headers while still writing to w.
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
-	bytes  int
-	wrote  bool
+	status   int
+	bytes    int
+	wrote    bool
+	hijacked bool
 }
 
 func (rr *responseRecorder) WriteHeader(code int) {
@@ -215,6 +232,40 @@ func (rr *responseRecorder) Write(b []byte) (int, error) {
 	n, err := rr.ResponseWriter.Write(b)
 	rr.bytes += n
 	return n, err
+}
+
+// Unwrap lets http.ResponseController (Go 1.20+) and Caddy traverse the
+// wrapper chain so inner capabilities stay reachable.
+func (rr *responseRecorder) Unwrap() http.ResponseWriter { return rr.ResponseWriter }
+
+// Flush delegates to the inner writer if it implements http.Flusher.
+// Required for SSE and any streaming response.
+func (rr *responseRecorder) Flush() {
+	if f, ok := rr.ResponseWriter.(http.Flusher); ok {
+		if !rr.wrote {
+			rr.wrote = true
+		}
+		f.Flush()
+	}
+}
+
+// Hijack delegates to the inner writer if it implements http.Hijacker.
+// Required for WebSocket upgrades and any raw TCP takeover.
+func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := rr.ResponseWriter.(http.Hijacker); ok {
+		rr.wrote = true
+		rr.hijacked = true
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// Push delegates to the inner writer if it implements http.Pusher.
+func (rr *responseRecorder) Push(target string, opts *http.PushOptions) error {
+	if p, ok := rr.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
 }
 
 func armKeyFor(token string) string    { return "debug:trace:" + token }
