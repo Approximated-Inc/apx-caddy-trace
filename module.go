@@ -6,7 +6,6 @@ import (
 
 func init() {
 	caddy.RegisterModule(&TraceHandler{})
-	// Registrations for MarkHandler and TraceTransport will be added by
-	// Tasks 1.9 and 1.10. Leaving the init isolated here so each task can
-	// append without conflicts.
+	caddy.RegisterModule(&MarkHandler{})
+	// Task 1.10 will register TraceTransport here.
 }
