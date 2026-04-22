@@ -123,6 +123,47 @@ func TestResponseRecorder_UnwrapReturnsInner(t *testing.T) {
 	require.Equal(t, http.ResponseWriter(inner), rr.Unwrap())
 }
 
+func TestTraceHandler_ResolveRedisOpts_InlineConfigWins(t *testing.T) {
+	h := &TraceHandler{
+		Redis: &RedisConfig{Host: "inline.example", Port: 6390, DB: 2, Password: "secret"},
+	}
+	opts, err := h.resolveRedisOpts()
+	require.NoError(t, err)
+	require.Equal(t, "inline.example:6390", opts.Addr)
+	require.Equal(t, 2, opts.DB)
+	require.Equal(t, "secret", opts.Password)
+	require.Nil(t, opts.TLSConfig)
+}
+
+func TestTraceHandler_ResolveRedisOpts_TLSEnablesTLSConfig(t *testing.T) {
+	h := &TraceHandler{Redis: &RedisConfig{Host: "h", Port: 6379, TLS: true}}
+	opts, err := h.resolveRedisOpts()
+	require.NoError(t, err)
+	require.NotNil(t, opts.TLSConfig)
+}
+
+func TestTraceHandler_ResolveRedisOpts_FallsBackToEnv(t *testing.T) {
+	t.Setenv("APX_TRACE_REDIS_URL", "redis://envfallback.example:6380/3")
+	h := &TraceHandler{Redis: nil}
+	opts, err := h.resolveRedisOpts()
+	require.NoError(t, err)
+	require.Equal(t, "envfallback.example:6380", opts.Addr)
+	require.Equal(t, 3, opts.DB)
+}
+
+func TestTraceHandler_ResolveRedisOpts_EmptyHostFallsBackToEnv(t *testing.T) {
+	t.Setenv("APX_TRACE_REDIS_URL", "redis://envfallback2.example:6381/0")
+	h := &TraceHandler{Redis: &RedisConfig{Port: 1234}} // Host blank
+	opts, err := h.resolveRedisOpts()
+	require.NoError(t, err)
+	require.Equal(t, "envfallback2.example:6381", opts.Addr)
+}
+
+func TestTraceHandler_ResolveHeaderName_InlineWins(t *testing.T) {
+	h := &TraceHandler{HeaderName: "X-Custom-Trace"}
+	require.Equal(t, "X-Custom-Trace", h.resolveHeaderName())
+}
+
 func TestTraceHandler_ValidToken_EmitsReceivedAndResponse(t *testing.T) {
 	fr := newFakeRedis()
 	token := "abcdefabcdefabcdefabcdefabcdefab"

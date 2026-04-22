@@ -3,6 +3,7 @@ package apxtrace
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// RedisConfig is an inline Redis configuration passed via the handler's JSON.
+// When present, it takes precedence over env-based configuration.
+type RedisConfig struct {
+	Host     string `json:"host,omitempty"`
+	Port     int    `json:"port,omitempty"`
+	DB       int    `json:"db,omitempty"`
+	Password string `json:"password,omitempty"`
+	TLS      bool   `json:"tls,omitempty"`
+}
+
 // armer is the subset of redis needed to check arming keys.
 type armer interface {
 	Get(ctx context.Context, key string) *redis.StringCmd
@@ -30,6 +41,9 @@ type armer interface {
 // TraceHandler is the outer wrapper installed once per server.
 // Dormant unless X-APX-Debug-Trace header is present with a valid token.
 type TraceHandler struct {
+	Redis      *RedisConfig `json:"redis,omitempty"`
+	HeaderName string       `json:"header_name,omitempty"`
+
 	logger       *zap.Logger
 	headerName   string
 	arm          armer
@@ -51,16 +65,16 @@ func (*TraceHandler) CaddyModule() caddy.ModuleInfo {
 // Provision initializes the handler with a Redis client + redactor.
 func (h *TraceHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
-	h.headerName = defaultStringEnv("APX_TRACE_HEADER", "X-APX-Debug-Trace")
+	h.headerName = h.resolveHeaderName()
 	h.redactor = DefaultRedactor()
 	h.emitters = make(map[string]*Emitter)
 
 	if h.arm == nil {
-		client, err := NewRedisClient()
+		opts, err := h.resolveRedisOpts()
 		if err != nil {
 			return fmt.Errorf("apx_trace provision: %w", err)
 		}
-		h.arm = client
+		h.arm = redis.NewClient(opts)
 	}
 	if h.emitterMaker == nil {
 		h.emitterMaker = func(token string) *Emitter {
@@ -68,6 +82,32 @@ func (h *TraceHandler) Provision(ctx caddy.Context) error {
 		}
 	}
 	return nil
+}
+
+func (h *TraceHandler) resolveHeaderName() string {
+	if h.HeaderName != "" {
+		return h.HeaderName
+	}
+	return defaultStringEnv("APX_TRACE_HEADER", "X-APX-Debug-Trace")
+}
+
+func (h *TraceHandler) resolveRedisOpts() (*redis.Options, error) {
+	if h.Redis != nil && h.Redis.Host != "" {
+		opts := &redis.Options{
+			Addr:         fmt.Sprintf("%s:%d", h.Redis.Host, h.Redis.Port),
+			Password:     h.Redis.Password,
+			DB:           h.Redis.DB,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  1 * time.Second,
+			WriteTimeout: 1 * time.Second,
+			PoolSize:     10,
+		}
+		if h.Redis.TLS {
+			opts.TLSConfig = &tls.Config{}
+		}
+		return opts, nil
+	}
+	return RedisOptsFromEnv()
 }
 
 // UnmarshalCaddyfile parses an empty block.
