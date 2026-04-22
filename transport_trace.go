@@ -115,6 +115,18 @@ func (t *TraceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return resp, err
 	}
 
+	// Snapshot response headers BEFORE any Caddy-side response mutations so the
+	// outer handler can diff them against the final wrapped response headers.
+	if resp != nil {
+		cloned := make(http.Header, len(resp.Header))
+		for k, vs := range resp.Header {
+			cp := make([]string, len(vs))
+			copy(cp, vs)
+			cloned[k] = cp
+		}
+		tc.UpstreamResponseHeaders = cloned
+	}
+
 	tc.App.EmitEvent(Event{
 		Type:   EventUpstreamResponse,
 		TsNs:   time.Now().UnixNano(),

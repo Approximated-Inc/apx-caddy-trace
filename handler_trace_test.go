@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,4 +207,202 @@ func TestTraceHandler_ValidToken_EmitsReceivedAndResponse(t *testing.T) {
 	require.Equal(t, tok, app.tokens[1])
 	// request_id should be consistent between received + response.
 	require.Equal(t, events[0].Payload["request_id"], events[1].Payload["request_id"])
+}
+
+// findEvent returns the first event of the given type, or fails the test.
+func findEvent(t *testing.T, events []Event, typ string) Event {
+	t.Helper()
+	for _, e := range events {
+		if e.Type == typ {
+			return e
+		}
+	}
+	t.Fatalf("expected event of type %q; got types %v", typ, eventTypes(events))
+	return Event{}
+}
+
+func eventTypes(events []Event) []string {
+	out := make([]string, len(events))
+	for i, e := range events {
+		out[i] = e.Type
+	}
+	return out
+}
+
+func TestResponseMutation_EmittedWhenResponseHeadersDiffer(t *testing.T) {
+	secret := "s"
+	app := newFakeTraceApp(secret)
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-1", VhostID: 1})
+
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+
+	// Simulate: outer handler runs, reverse_proxy transport captures upstream
+	// headers into TraceContext, then a response-header mutator modifies them
+	// before the response leaves Caddy.
+	upstreamHeaders := http.Header{
+		"Server":        {"nginx"},
+		"Cache-Control": {"no-cache"},
+	}
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		tc := FromContext(r.Context())
+		require.NotNil(t, tc, "trace context must be present in next handler")
+		tc.UpstreamResponseHeaders = upstreamHeaders.Clone()
+
+		// Final response: Server removed, Cache-Control changed, X-Frame-Options added.
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.WriteHeader(200)
+		return nil
+	})
+
+	require.NoError(t, h.ServeHTTP(w, r, next))
+
+	events := app.eventsCopy()
+	mut := findEvent(t, events, EventResponseMutation)
+	require.Equal(t, SourceCluster, mut.Source)
+	require.Equal(t, "response", mut.Payload["label"])
+	require.NotEmpty(t, mut.Payload["request_id"])
+
+	diff, ok := mut.Payload["diff"].(SnapshotDiff)
+	require.True(t, ok, "diff should be a SnapshotDiff; got %T", mut.Payload["diff"])
+
+	require.Len(t, diff.HeadersAdded, 1)
+	require.Equal(t, "X-Frame-Options", diff.HeadersAdded[0].Name)
+	require.Equal(t, []string{"DENY"}, diff.HeadersAdded[0].After)
+
+	require.Len(t, diff.HeadersRemoved, 1)
+	require.Equal(t, "Server", diff.HeadersRemoved[0].Name)
+	require.Equal(t, []string{"nginx"}, diff.HeadersRemoved[0].Before)
+
+	require.Len(t, diff.HeadersChanged, 1)
+	require.Equal(t, "Cache-Control", diff.HeadersChanged[0].Name)
+	require.Equal(t, []string{"no-cache"}, diff.HeadersChanged[0].Before)
+	require.Equal(t, []string{"public, max-age=60"}, diff.HeadersChanged[0].After)
+
+	// response_mutation must come before cluster_response.
+	mutIdx := indexOfEvent(events, EventResponseMutation)
+	respIdx := indexOfEvent(events, EventClusterResponse)
+	require.Less(t, mutIdx, respIdx, "response_mutation must be emitted before cluster_response")
+}
+
+func TestResponseMutation_NotEmittedWhenNoChanges(t *testing.T) {
+	secret := "s"
+	app := newFakeTraceApp(secret)
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-1", VhostID: 1})
+
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+
+	upstream := http.Header{"Content-Type": {"text/plain"}}
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		tc := FromContext(r.Context())
+		tc.UpstreamResponseHeaders = upstream.Clone()
+		// Final response mirrors upstream exactly.
+		for k, vs := range upstream {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(200)
+		return nil
+	})
+
+	require.NoError(t, h.ServeHTTP(w, r, next))
+
+	for _, e := range app.eventsCopy() {
+		require.NotEqual(t, EventResponseMutation, e.Type,
+			"no response_mutation should be emitted when headers are unchanged")
+	}
+}
+
+func TestResponseMutation_NotEmittedWhenNoUpstreamSnapshot(t *testing.T) {
+	secret := "s"
+	app := newFakeTraceApp(secret)
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-1", VhostID: 1})
+
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+
+	// Handler sets some response headers but never populates
+	// UpstreamResponseHeaders — e.g. request short-circuited before any
+	// upstream round-trip. Must not emit response_mutation.
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Handler-Set", "yep")
+		w.WriteHeader(204)
+		return nil
+	})
+
+	require.NoError(t, h.ServeHTTP(w, r, next))
+
+	for _, e := range app.eventsCopy() {
+		require.NotEqual(t, EventResponseMutation, e.Type,
+			"no response_mutation should be emitted without upstream snapshot")
+	}
+}
+
+func TestResponseMutation_RedactsSensitiveValues(t *testing.T) {
+	secret := "s"
+	app := newFakeTraceApp(secret)
+	h := &TraceHandler{
+		headerName: "X-APX-Debug-Trace",
+		app:        app,
+		redactor:   DefaultRedactor(),
+	}
+	tok := validTokenFor(t, secret, TokenPayload{DebugRequestID: "dr-1", VhostID: 1})
+
+	r := httptest.NewRequest("GET", "/foo", nil)
+	r.Header.Set("X-APX-Debug-Trace", tok)
+	w := httptest.NewRecorder()
+
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		tc := FromContext(r.Context())
+		tc.UpstreamResponseHeaders = http.Header{"Set-Cookie": {"session=upstream-secret"}}
+		w.Header().Set("Set-Cookie", "session=rewritten-secret")
+		w.WriteHeader(200)
+		return nil
+	})
+
+	require.NoError(t, h.ServeHTTP(w, r, next))
+
+	mut := findEvent(t, app.eventsCopy(), EventResponseMutation)
+	diff := mut.Payload["diff"].(SnapshotDiff)
+	require.Len(t, diff.HeadersChanged, 1)
+	change := diff.HeadersChanged[0]
+	require.Equal(t, "Set-Cookie", change.Name)
+	require.Len(t, change.Before, 1)
+	require.Len(t, change.After, 1)
+	require.True(t, strings.HasPrefix(change.Before[0], "<sha256:"),
+		"before value should be redacted, got %q", change.Before[0])
+	require.True(t, strings.HasPrefix(change.After[0], "<sha256:"),
+		"after value should be redacted, got %q", change.After[0])
+	require.NotContains(t, change.Before[0], "upstream-secret")
+	require.NotContains(t, change.After[0], "rewritten-secret")
+}
+
+func indexOfEvent(events []Event, typ string) int {
+	for i, e := range events {
+		if e.Type == typ {
+			return i
+		}
+	}
+	return -1
 }

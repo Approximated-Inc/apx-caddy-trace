@@ -52,6 +52,63 @@ type SnapshotDiff struct {
 	MethodChange   *Change        `json:"method_change,omitempty"`
 }
 
+// Empty reports whether this diff has no changes in any section.
+func (d SnapshotDiff) Empty() bool {
+	return len(d.HeadersAdded) == 0 &&
+		len(d.HeadersRemoved) == 0 &&
+		len(d.HeadersChanged) == 0 &&
+		d.URIChange == nil &&
+		d.MethodChange == nil
+}
+
+// DiffHeadersOnly computes a headers-only SnapshotDiff between two header sets.
+// Sensitive header values are redacted via the provided Redactor.
+// URIChange / MethodChange are always nil in the returned diff.
+func DiffHeadersOnly(before, after http.Header, r *Redactor) SnapshotDiff {
+	if r == nil {
+		r = DefaultRedactor()
+	}
+	var diff SnapshotDiff
+
+	beforeKeys := map[string]bool{}
+	for k := range before {
+		beforeKeys[k] = true
+	}
+	afterKeys := map[string]bool{}
+	for k := range after {
+		afterKeys[k] = true
+	}
+
+	for k := range afterKeys {
+		if !beforeKeys[k] {
+			diff.HeadersAdded = append(diff.HeadersAdded, HeaderChange{
+				Name:  k,
+				After: r.redactValues(k, after[k]),
+			})
+		} else if !slices.Equal(before[k], after[k]) {
+			diff.HeadersChanged = append(diff.HeadersChanged, HeaderChange{
+				Name:   k,
+				Before: r.redactValues(k, before[k]),
+				After:  r.redactValues(k, after[k]),
+			})
+		}
+	}
+	for k := range beforeKeys {
+		if !afterKeys[k] {
+			diff.HeadersRemoved = append(diff.HeadersRemoved, HeaderChange{
+				Name:   k,
+				Before: r.redactValues(k, before[k]),
+			})
+		}
+	}
+
+	sort.Slice(diff.HeadersAdded, func(i, j int) bool { return diff.HeadersAdded[i].Name < diff.HeadersAdded[j].Name })
+	sort.Slice(diff.HeadersRemoved, func(i, j int) bool { return diff.HeadersRemoved[i].Name < diff.HeadersRemoved[j].Name })
+	sort.Slice(diff.HeadersChanged, func(i, j int) bool { return diff.HeadersChanged[i].Name < diff.HeadersChanged[j].Name })
+
+	return diff
+}
+
 // DiffSnapshots computes the SnapshotDiff from before to after. Sensitive
 // header values are redacted using DefaultRedactor before being emitted.
 func DiffSnapshots(before, after RequestSnapshot) SnapshotDiff {

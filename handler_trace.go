@@ -130,6 +130,27 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		if rec != nil {
 			p["panic"] = fmt.Sprintf("%v", rec)
 		}
+
+		// Emit response_mutation (once, cluster-wide) if the upstream returned
+		// headers and Caddy's response-side middleware chain changed them.
+		// Must come BEFORE cluster_response so timeline ordering stays
+		// upstream_response → response_mutation → cluster_response.
+		if tc.UpstreamResponseHeaders != nil && !wrapped.hijacked {
+			diff := DiffHeadersOnly(tc.UpstreamResponseHeaders, wrapped.Header(), h.redactor)
+			if !diff.Empty() {
+				h.app.EmitEvent(Event{
+					Type:   EventResponseMutation,
+					TsNs:   time.Now().UnixNano(),
+					Source: SourceCluster,
+					Payload: map[string]any{
+						"label":      "response",
+						"diff":       diff,
+						"request_id": tc.RequestID,
+					},
+				}, token)
+			}
+		}
+
 		h.app.EmitEvent(Event{
 			Type:    EventClusterResponse,
 			TsNs:    time.Now().UnixNano(),

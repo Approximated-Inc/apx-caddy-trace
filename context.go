@@ -2,6 +2,7 @@ package apxtrace
 
 import (
 	"context"
+	"net/http"
 	"time"
 )
 
@@ -20,6 +21,12 @@ type TraceContext struct {
 	StartTime      time.Time
 	App            AppRef
 	LastSnapshot   RequestSnapshot
+
+	// UpstreamResponseHeaders is a snapshot of response headers captured inside
+	// the reverse_proxy transport at the moment the upstream returned, BEFORE
+	// any Caddy-side response mutations are applied. Nil when no upstream
+	// round-trip occurred (e.g. handler short-circuit, upstream error).
+	UpstreamResponseHeaders http.Header
 }
 
 func withTrace(ctx context.Context, tc *TraceContext) context.Context {

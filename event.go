@@ -14,6 +14,7 @@ const (
 	EventRouteMatched        = "route_matched"
 	EventEdgeSequenceEntered = "edge_sequence_entered"
 	EventRequestMutation     = "request_mutation"
+	EventResponseMutation    = "response_mutation"
 	EventUpstreamRequest     = "upstream_request"
 	EventUpstreamResponse    = "upstream_response"
 	EventUpstreamError       = "upstream_error"
