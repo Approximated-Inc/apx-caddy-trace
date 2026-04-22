@@ -56,6 +56,20 @@ func (r *Redactor) RedactHeaders(h http.Header) http.Header {
 	return out
 }
 
+// redactValues returns a copy of vs with each value hashed if the header
+// name is in the sensitive set, otherwise copied unchanged.
+func (r *Redactor) redactValues(name string, vs []string) []string {
+	out := make([]string, len(vs))
+	if _, sensitive := r.sensitive[strings.ToLower(name)]; sensitive {
+		for i, v := range vs {
+			out[i] = hashValue(v)
+		}
+	} else {
+		copy(out, vs)
+	}
+	return out
+}
+
 func hashValue(v string) string {
 	sum := sha256.Sum256([]byte(v))
 	return fmt.Sprintf("<sha256:%s>", hex.EncodeToString(sum[:6]))
