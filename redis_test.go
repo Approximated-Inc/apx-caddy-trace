@@ -33,3 +33,24 @@ func TestRedisOptsFromEnv_ReturnsErrorWhenUnset(t *testing.T) {
 	_, err := RedisOptsFromEnv()
 	require.Error(t, err)
 }
+
+func TestRedisOptsFromEnv_ExtractsPasswordFromURL(t *testing.T) {
+	t.Setenv("APX_TRACE_REDIS_URL", "redis://ignored_user:secretpass@example.com:6379/0")
+	opts, err := RedisOptsFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, "secretpass", opts.Password)
+}
+
+func TestRedisOptsFromEnv_RedissEnablesTLS(t *testing.T) {
+	t.Setenv("APX_TRACE_REDIS_URL", "rediss://example.com:6379/0")
+	opts, err := RedisOptsFromEnv()
+	require.NoError(t, err)
+	require.NotNil(t, opts.TLSConfig)
+}
+
+func TestRedisOptsFromEnv_RejectsUnknownScheme(t *testing.T) {
+	t.Setenv("APX_TRACE_REDIS_URL", "http://example.com:6379/0")
+	_, err := RedisOptsFromEnv()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported scheme")
+}

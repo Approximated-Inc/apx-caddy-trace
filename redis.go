@@ -2,11 +2,13 @@ package apxtrace
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,6 +27,10 @@ func RedisOptsFromEnv() (*redis.Options, error) {
 	port := os.Getenv("REDIS_PORT")
 	if host == "" || port == "" {
 		return nil, ErrRedisNotConfigured
+	}
+	// Validate port is numeric to catch misconfiguration early.
+	if _, err := strconv.Atoi(port); err != nil {
+		return nil, fmt.Errorf("invalid REDIS_PORT: %w", err)
 	}
 	db := 0
 	if raw := os.Getenv("REDIS_DB"); raw != "" {
@@ -50,16 +56,22 @@ func parseRedisURL(raw string) (*redis.Options, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid APX_TRACE_REDIS_URL: %w", err)
 	}
+	if u.Scheme != "redis" && u.Scheme != "rediss" {
+		return nil, fmt.Errorf("APX_TRACE_REDIS_URL: unsupported scheme %q (want redis or rediss)", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("APX_TRACE_REDIS_URL: missing host")
+	}
 	db := 0
 	if u.Path != "" && u.Path != "/" {
-		n, err := strconv.Atoi(u.Path[1:])
+		n, err := strconv.Atoi(strings.TrimPrefix(u.Path, "/"))
 		if err != nil {
 			return nil, fmt.Errorf("invalid DB in APX_TRACE_REDIS_URL: %w", err)
 		}
 		db = n
 	}
 	password, _ := u.User.Password()
-	return &redis.Options{
+	opts := &redis.Options{
 		Addr:         u.Host,
 		Password:     password,
 		DB:           db,
@@ -67,7 +79,11 @@ func parseRedisURL(raw string) (*redis.Options, error) {
 		ReadTimeout:  1 * time.Second,
 		WriteTimeout: 1 * time.Second,
 		PoolSize:     10,
-	}, nil
+	}
+	if u.Scheme == "rediss" {
+		opts.TLSConfig = &tls.Config{}
+	}
+	return opts, nil
 }
 
 // NewRedisClient constructs a client from env-provided options. Non-blocking:
