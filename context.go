@@ -18,8 +18,7 @@ type TraceContext struct {
 	ProxyServerID string
 	RequestID     string
 	StartTime     time.Time
-	// Emitter is typed `any` for now; narrowed to *Emitter in Task 1.7.
-	Emitter      any
+	Emitter      *Emitter
 	LastSnapshot RequestSnapshot
 }
 
