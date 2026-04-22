@@ -40,3 +40,15 @@ func TestRedactHeaders_StableHashForSameValue(t *testing.T) {
 	r2 := r.RedactHeaders(h2)
 	require.Equal(t, r1["Cookie"][0], r2["Cookie"][0])
 }
+
+func TestRedactHeaders_OutputFormatIsStable(t *testing.T) {
+	r := DefaultRedactor()
+	h := http.Header{}
+	h.Set("Authorization", "Bearer abc123")
+	out := r.RedactHeaders(h)
+
+	// Locks the cross-language contract: Elixir produces the same string
+	// from :crypto.hash(:sha256, v) |> binary_part(0, 6) |> Base.encode16(case: :lower)
+	require.Equal(t, "<sha256:c84d069b7e1e>", out["Authorization"][0])
+	require.Regexp(t, `^<sha256:[0-9a-f]{12}>$`, out["Authorization"][0])
+}
