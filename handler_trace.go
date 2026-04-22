@@ -1,0 +1,234 @@
+package apxtrace
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"regexp"
+	"sync"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+)
+
+// armer is the subset of redis needed to check arming keys.
+type armer interface {
+	Get(ctx context.Context, key string) *redis.StringCmd
+	streamer
+}
+
+// TraceHandler is the outer wrapper installed once per server.
+// Dormant unless X-APX-Debug-Trace header is present with a valid token.
+type TraceHandler struct {
+	logger       *zap.Logger
+	headerName   string
+	arm          armer
+	emitterMaker func(token string) *Emitter
+	redactor     *Redactor
+
+	mu       sync.Mutex
+	emitters map[string]*Emitter
+}
+
+// CaddyModule returns the Caddy module information.
+func (*TraceHandler) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.apx_trace",
+		New: func() caddy.Module { return new(TraceHandler) },
+	}
+}
+
+// Provision initializes the handler with a Redis client + redactor.
+func (h *TraceHandler) Provision(ctx caddy.Context) error {
+	h.logger = ctx.Logger()
+	h.headerName = defaultStringEnv("APX_TRACE_HEADER", "X-APX-Debug-Trace")
+	h.redactor = DefaultRedactor()
+	h.emitters = make(map[string]*Emitter)
+
+	if h.arm == nil {
+		client, err := NewRedisClient()
+		if err != nil {
+			return fmt.Errorf("apx_trace provision: %w", err)
+		}
+		h.arm = client
+	}
+	if h.emitterMaker == nil {
+		h.emitterMaker = func(token string) *Emitter {
+			return NewEmitter(h.arm, streamKeyFor(token), 256)
+		}
+	}
+	return nil
+}
+
+// UnmarshalCaddyfile parses an empty block.
+func (h *TraceHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
+
+var tokenFormat = regexp.MustCompile(`^[A-Za-z0-9_-]{32,64}$`)
+
+// ServeHTTP is the hot path. Must be cheap when no trace header is present.
+func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	token := r.Header.Get(h.headerName)
+	if token == "" {
+		metricRequestsTotal.WithLabelValues("no_header").Inc()
+		return next.ServeHTTP(w, r)
+	}
+	if !tokenFormat.MatchString(token) {
+		metricRequestsTotal.WithLabelValues("invalid_token").Inc()
+		return next.ServeHTTP(w, r)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	raw, err := h.arm.Get(ctx, armKeyFor(token)).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			metricRequestsTotal.WithLabelValues("invalid_token").Inc()
+			return next.ServeHTTP(w, r)
+		}
+		metricRedisErrors.Inc()
+		metricRequestsTotal.WithLabelValues("redis_error").Inc()
+		return next.ServeHTTP(w, r)
+	}
+
+	var armPayload struct {
+		VhostID       string `json:"virtual_host_id"`
+		ProxyServerID string `json:"proxy_server_id"`
+	}
+	if err := json.Unmarshal([]byte(raw), &armPayload); err != nil {
+		metricRequestsTotal.WithLabelValues("invalid_token").Inc()
+		return next.ServeHTTP(w, r)
+	}
+
+	metricRequestsTotal.WithLabelValues("active").Inc()
+
+	emitter := h.acquireEmitter(token)
+	tc := &TraceContext{
+		Token:         token,
+		VhostID:       armPayload.VhostID,
+		ProxyServerID: armPayload.ProxyServerID,
+		RequestID:     uuid.NewString(),
+		StartTime:     time.Now(),
+		Emitter:       emitter,
+		LastSnapshot:  Snapshot(r),
+	}
+
+	// cluster_received
+	emitter.Emit(Event{
+		Type:   EventClusterReceived,
+		TsNs:   time.Now().UnixNano(),
+		Source: SourceCluster,
+		Payload: map[string]any{
+			"method":     r.Method,
+			"uri":        r.URL.RequestURI(),
+			"host":       r.Host,
+			"headers":    h.redactor.RedactHeaders(r.Header),
+			"remote_ip":  r.RemoteAddr,
+			"request_id": tc.RequestID,
+		},
+	})
+
+	wrapped := &responseRecorder{ResponseWriter: w, status: 200}
+	req := r.WithContext(withTrace(r.Context(), tc))
+	servErr := next.ServeHTTP(wrapped, req)
+
+	total := time.Since(tc.StartTime)
+	payload := map[string]any{
+		"status":            wrapped.status,
+		"response_headers":  h.redactor.RedactHeaders(wrapped.Header()),
+		"bytes_written":     wrapped.bytes,
+		"total_duration_ns": total.Nanoseconds(),
+		"request_id":        tc.RequestID,
+	}
+	if servErr != nil {
+		payload["error"] = servErr.Error()
+	}
+	emitter.Emit(Event{
+		Type:    EventClusterResponse,
+		TsNs:    time.Now().UnixNano(),
+		Source:  SourceCluster,
+		Payload: payload,
+	})
+
+	// Release emitter asynchronously after request completes.
+	go h.releaseEmitter(token, 2*time.Second)
+
+	return servErr
+}
+
+func (h *TraceHandler) acquireEmitter(token string) *Emitter {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.emitters == nil {
+		h.emitters = make(map[string]*Emitter)
+	}
+	if e, ok := h.emitters[token]; ok {
+		return e
+	}
+	e := h.emitterMaker(token)
+	h.emitters[token] = e
+	return e
+}
+
+func (h *TraceHandler) releaseEmitter(token string, after time.Duration) {
+	time.Sleep(after)
+	h.mu.Lock()
+	e, ok := h.emitters[token]
+	if ok {
+		delete(h.emitters, token)
+	}
+	h.mu.Unlock()
+	if e != nil {
+		e.Close()
+	}
+}
+
+// responseRecorder captures status + bytes + headers while still writing to w.
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+	wrote  bool
+}
+
+func (rr *responseRecorder) WriteHeader(code int) {
+	if rr.wrote {
+		return
+	}
+	rr.status = code
+	rr.wrote = true
+	rr.ResponseWriter.WriteHeader(code)
+}
+
+func (rr *responseRecorder) Write(b []byte) (int, error) {
+	if !rr.wrote {
+		rr.wrote = true
+	}
+	n, err := rr.ResponseWriter.Write(b)
+	rr.bytes += n
+	return n, err
+}
+
+func armKeyFor(token string) string    { return "debug:trace:" + token }
+func streamKeyFor(token string) string { return "debug:trace:" + token + ":events" }
+
+func defaultStringEnv(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+var (
+	_ caddy.Provisioner           = (*TraceHandler)(nil)
+	_ caddyfile.Unmarshaler       = (*TraceHandler)(nil)
+	_ caddyhttp.MiddlewareHandler = (*TraceHandler)(nil)
+)
