@@ -25,6 +25,7 @@ func DefaultRedactor() *Redactor {
 		"api-key",
 		"apx-internal-key",
 		"proxy-authorization",
+		"x-apx-debug-trace",
 	})
 }
 
