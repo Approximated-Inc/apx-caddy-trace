@@ -199,14 +199,22 @@ func TestTraceHandler_ValidToken_EmitsReceivedAndResponse(t *testing.T) {
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextHandlerOK()))
 
-	require.Equal(t, 2, app.eventCount(), "expected cluster_received + cluster_response")
+	require.Equal(t, 3, app.eventCount(),
+		"expected cluster_received + cluster_response_started + cluster_response")
 	events := app.eventsCopy()
 	require.Equal(t, EventClusterReceived, events[0].Type)
-	require.Equal(t, EventClusterResponse, events[1].Type)
+	require.Equal(t, EventClusterResponseStarted, events[1].Type)
+	require.Equal(t, EventClusterResponse, events[2].Type)
 	require.Equal(t, tok, app.tokens[0])
 	require.Equal(t, tok, app.tokens[1])
-	// request_id should be consistent between received + response.
+	require.Equal(t, tok, app.tokens[2])
+	// request_id should be consistent across all three.
 	require.Equal(t, events[0].Payload["request_id"], events[1].Payload["request_id"])
+	require.Equal(t, events[0].Payload["request_id"], events[2].Payload["request_id"])
+	// cluster_response_started must be stamped at-or-before cluster_response
+	// since the former fires on first Write and the latter in the deferred
+	// finalizer after the handler returns.
+	require.LessOrEqual(t, events[1].TsNs, events[2].TsNs)
 }
 
 // findEvent returns the first event of the given type, or fails the test.

@@ -107,6 +107,20 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}, token)
 
 	wrapped := &responseRecorder{ResponseWriter: w, status: 200}
+	// Emit cluster_response_started the first time anything tries to write
+	// the response — before the body streams through flow control. Gives
+	// the app a stable anchor for "last-leg" network timing that doesn't
+	// depend on how long the body takes to drain.
+	wrapped.onFirstWrite = func() {
+		h.app.EmitEvent(Event{
+			Type:   EventClusterResponseStarted,
+			TsNs:   time.Now().UnixNano(),
+			Source: SourceCluster,
+			Payload: map[string]any{
+				"request_id": tc.RequestID,
+			},
+		}, token)
+	}
 	req := r.WithContext(withTrace(r.Context(), tc))
 
 	var servErr error
@@ -171,10 +185,25 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 // responseRecorder captures status + bytes + headers while still writing to w.
 type responseRecorder struct {
 	http.ResponseWriter
-	status   int
-	bytes    int
-	wrote    bool
-	hijacked bool
+	status       int
+	bytes        int
+	wrote        bool
+	hijacked     bool
+	onFirstWrite func() // called at most once on first WriteHeader/Write/Flush
+}
+
+// markWrote flips the wrote flag and fires onFirstWrite exactly once.
+// Call this from every response-producing method (WriteHeader, Write,
+// Flush) so the first one observed triggers the stamp, no matter which
+// entry point the downstream handler uses.
+func (rr *responseRecorder) markWrote() {
+	if rr.wrote {
+		return
+	}
+	rr.wrote = true
+	if rr.onFirstWrite != nil {
+		rr.onFirstWrite()
+	}
 }
 
 func (rr *responseRecorder) WriteHeader(code int) {
@@ -182,14 +211,12 @@ func (rr *responseRecorder) WriteHeader(code int) {
 		return
 	}
 	rr.status = code
-	rr.wrote = true
+	rr.markWrote()
 	rr.ResponseWriter.WriteHeader(code)
 }
 
 func (rr *responseRecorder) Write(b []byte) (int, error) {
-	if !rr.wrote {
-		rr.wrote = true
-	}
+	rr.markWrote()
 	n, err := rr.ResponseWriter.Write(b)
 	rr.bytes += n
 	return n, err
@@ -203,9 +230,7 @@ func (rr *responseRecorder) Unwrap() http.ResponseWriter { return rr.ResponseWri
 // Required for SSE and any streaming response.
 func (rr *responseRecorder) Flush() {
 	if f, ok := rr.ResponseWriter.(http.Flusher); ok {
-		if !rr.wrote {
-			rr.wrote = true
-		}
+		rr.markWrote()
 		f.Flush()
 	}
 }
