@@ -189,7 +189,7 @@ type responseRecorder struct {
 	bytes        int
 	wrote        bool
 	hijacked     bool
-	onFirstWrite func() // called at most once on first WriteHeader/Write/Flush
+	onFirstWrite func() // called at most once on first non-1xx WriteHeader/Write/Flush
 }
 
 // markWrote flips the wrote flag and fires onFirstWrite exactly once.
@@ -208,6 +208,12 @@ func (rr *responseRecorder) markWrote() {
 
 func (rr *responseRecorder) WriteHeader(code int) {
 	if rr.wrote {
+		return
+	}
+	// 1xx (e.g. 103 Early Hints forwarded by reverse_proxy) is informational:
+	// pass it through; the response has not started for tracing purposes.
+	if 100 <= code && code <= 199 {
+		rr.ResponseWriter.WriteHeader(code)
 		return
 	}
 	rr.status = code
