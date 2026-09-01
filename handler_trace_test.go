@@ -465,3 +465,13 @@ func TestResponseRecorder_103ThroughReverseProxyPreservesFinalStatus(t *testing.
 	require.Equal(t, http.StatusNotFound, res.StatusCode)
 	require.Equal(t, http.StatusNotFound, got.status)
 }
+
+func TestResponseRecorder_101SwitchingProtocolsIsFinal(t *testing.T) {
+	stamps := 0
+	rr := &responseRecorder{ResponseWriter: httptest.NewRecorder(), status: 200}
+	rr.onFirstWrite = func() { stamps++ }
+	rr.WriteHeader(http.StatusSwitchingProtocols)
+	require.Equal(t, http.StatusSwitchingProtocols, rr.status)
+	require.True(t, rr.wrote)
+	require.Equal(t, 1, stamps)
+}
