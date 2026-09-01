@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -413,4 +415,53 @@ func indexOfEvent(events []Event, typ string) int {
 		}
 	}
 	return -1
+}
+
+func TestResponseRecorder_103EarlyHintsDoesNotFinalizeStatus(t *testing.T) {
+	var got *responseRecorder
+	stamps := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rr := &responseRecorder{ResponseWriter: w, status: 200}
+		rr.onFirstWrite = func() { stamps++ }
+		rr.WriteHeader(http.StatusEarlyHints)
+		require.Equal(t, 0, stamps, "1xx must not fire cluster_response_started")
+		rr.Header().Set("Location", "/login")
+		rr.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = rr.Write(nil)
+		got = rr
+	}))
+	defer srv.Close()
+
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := c.Get(srv.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusTemporaryRedirect, res.StatusCode)
+	require.Equal(t, "/login", res.Header.Get("Location"))
+	require.Equal(t, http.StatusTemporaryRedirect, got.status)
+	require.True(t, got.wrote)
+	require.Equal(t, 1, stamps)
+}
+
+func TestResponseRecorder_103ThroughReverseProxyPreservesFinalStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("nope"))
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	rp := httputil.NewSingleHostReverseProxy(u)
+
+	var got *responseRecorder
+	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rr := &responseRecorder{ResponseWriter: w, status: 200}
+		rp.ServeHTTP(rr, r)
+		got = rr
+	}))
+	defer edge.Close()
+
+	res, err := http.Get(edge.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNotFound, res.StatusCode)
+	require.Equal(t, http.StatusNotFound, got.status)
 }
