@@ -2,6 +2,7 @@ package apxtrace
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -231,34 +232,49 @@ func (rr *responseRecorder) Write(b []byte) (int, error) {
 
 // Unwrap lets http.ResponseController (Go 1.20+) and Caddy traverse the
 // wrapper chain so inner capabilities stay reachable.
+//
+// Flush, Hijack and Push walk Unwrap rather than type-asserting the inner
+// writer: Caddy 2.11.6+'s IdleTimeoutWriter has neither Flush nor Hijack.
 func (rr *responseRecorder) Unwrap() http.ResponseWriter { return rr.ResponseWriter }
 
-// Flush delegates to the inner writer if it implements http.Flusher.
-// Required for SSE and any streaming response.
-func (rr *responseRecorder) Flush() {
-	if f, ok := rr.ResponseWriter.(http.Flusher); ok {
+// Flush serves callers that type-assert http.Flusher. Required for SSE and
+// any streaming response.
+func (rr *responseRecorder) Flush() { _ = rr.FlushError() }
+
+// FlushError is what http.ResponseController (and so reverse_proxy) calls.
+// Only a flush that reached a writer starts the response.
+func (rr *responseRecorder) FlushError() error {
+	err := http.NewResponseController(rr.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
 		rr.markWrote()
-		f.Flush()
 	}
+	return err
 }
 
-// Hijack delegates to the inner writer if it implements http.Hijacker.
-// Required for WebSocket upgrades and any raw TCP takeover.
+// Hijack is required for WebSocket upgrades and any raw TCP takeover.
 func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := rr.ResponseWriter.(http.Hijacker); ok {
+	conn, brw, err := http.NewResponseController(rr.ResponseWriter).Hijack()
+	if err == nil {
 		rr.wrote = true
 		rr.hijacked = true
-		return hj.Hijack()
 	}
-	return nil, nil, http.ErrNotSupported
+	return conn, brw, err
 }
 
-// Push delegates to the inner writer if it implements http.Pusher.
+// Push (HTTP/2 server push) walks Unwrap the way ResponseController does;
+// ResponseController has no Push of its own.
 func (rr *responseRecorder) Push(target string, opts *http.PushOptions) error {
-	if p, ok := rr.ResponseWriter.(http.Pusher); ok {
-		return p.Push(target, opts)
+	w := rr.ResponseWriter
+	for {
+		switch t := w.(type) {
+		case http.Pusher:
+			return t.Push(target, opts)
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return http.ErrNotSupported
+		}
 	}
-	return http.ErrNotSupported
 }
 
 func defaultStringEnv(name, fallback string) string {
